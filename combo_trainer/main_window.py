@@ -49,6 +49,8 @@ from .controllers import NoteStatus, PracticeController, RecordController  # noq
 from .frame_clock import FrameClock  # noqa: E402
 from .input_engine import InputThread  # noqa: E402
 from .models import ComboManager  # noqa: E402
+from .profile_dialog import ProfileDialog  # noqa: E402
+from .profiles import ProfileManager, ResolvedProfile  # noqa: E402
 from .state import AppMode, ModeController  # noqa: E402
 from .timeline import TimelineOverlay  # noqa: E402
 
@@ -191,11 +193,14 @@ class MainWindow(QMainWindow):
         # Core subsystems -----------------------------------------------------
         self.frame_clock = FrameClock()
         self.combo_manager = ComboManager()
+        self.profile_manager = ProfileManager.load_or_seed()
         self.mode_controller = ModeController(self)
         self.record_controller = RecordController(self.combo_manager, self)
         self.practice_controller = PracticeController(parent=self)
         self.sfx = SfxPlayer()
-        self.input_thread = InputThread(self.frame_clock)
+        self.input_thread = InputThread(
+            self.frame_clock, profile=self._resolved_profile()
+        )
 
         self._duration_s = 0.0
         self._slider_dragging = False
@@ -203,6 +208,11 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menus()
         self._wire_signals()
+
+        # Any rebind — from the dialog, the Layout menu or a combo file's
+        # character — re-resolves and hot-swaps the input thread's table.
+        self.profile_manager.add_listener(self._on_profiles_changed)
+        self._on_profiles_changed(self.profile_manager)
 
         self._ui_clock = QTimer(self)
         self._ui_clock.setInterval(16)
@@ -239,8 +249,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.stats_label = QLabel("")
+        self.profile_label = QLabel("")
+        self.profile_label.setToolTip("Active game profile · layout  (Ctrl+B to rebind)")
         self.pad_label = QLabel("🎮 waiting…")
         self.statusBar().addPermanentWidget(self.stats_label)
+        self.statusBar().addPermanentWidget(self.profile_label)
         self.statusBar().addPermanentWidget(self.pad_label)
         self.statusBar().showMessage("Open a video to begin.  Mode: IDLE")
 
@@ -327,6 +340,106 @@ class MainWindow(QMainWindow):
         act_test.setShortcut("Ctrl+T")
         act_test.triggered.connect(self._open_controller_test)
         m_input.addAction(act_test)
+
+        act_profiles = QAction("&Profiles && Rebinding…", self)
+        act_profiles.setShortcut("Ctrl+B")
+        act_profiles.triggered.connect(self._open_profile_dialog)
+        m_input.addAction(act_profiles)
+
+        m_input.addSeparator()
+        self.menu_layouts = m_input.addMenu("Active &Layout")
+        self._layout_group = QActionGroup(self)
+        self._layout_group.setExclusive(True)
+        self._layout_menu_ids: list[str] = []
+        self._rebuild_layout_menu()
+
+    # -- profiles -------------------------------------------------------------------
+
+    def _resolved_profile(self) -> ResolvedProfile | None:
+        """Active (game, layout, device) flattened for the input thread."""
+        try:
+            return self.profile_manager.resolved()
+        except Exception as exc:  # no games seeded / unreadable profile file
+            self.statusBar().showMessage(f"Profile error: {exc}", 8000)
+            return None
+
+    def _on_profiles_changed(self, _manager: ProfileManager) -> None:
+        """Single reaction point for every profile mutation."""
+        profile = self._resolved_profile()
+        if profile is None:
+            return
+        self.input_thread.set_profile(profile)  # atomic hot-swap, no restart
+        self.profile_label.setText(f"🕹 {profile.title}")
+        validation = self.profile_manager.validate()
+        if not validation.ok:
+            self.profile_label.setText(f"🕹 {profile.title}  ⚠")
+            self.profile_label.setToolTip(validation.summary())
+        else:
+            self.profile_label.setToolTip(
+                f"{validation.summary()}  (Ctrl+B to rebind)"
+            )
+        self._rebuild_layout_menu()
+
+    @staticmethod
+    def _layout_menu_text(layout) -> str:
+        return f"{layout.name}  ({layout.character})" if layout.character else layout.name
+
+    def _rebuild_layout_menu(self) -> None:
+        """Quick-switch list of the active game's layouts.
+
+        Refreshing in place when the layout SET is unchanged is not an
+        optimisation: this runs from `_on_profiles_changed`, which is reached
+        from one of these actions' own `triggered` handler. Rebuilding there
+        would destroy the action mid-emission.
+        """
+        game = self.profile_manager.active_game
+        if game is None:
+            self._clear_layout_menu()
+            self.menu_layouts.setEnabled(False)
+            return
+
+        self.menu_layouts.setEnabled(True)
+        active = self.profile_manager.active_layout_id
+        if list(game.layouts) == self._layout_menu_ids:
+            for action in self._layout_group.actions():
+                layout = game.layout(action.data())
+                if layout is not None:
+                    action.setText(self._layout_menu_text(layout))
+                    action.setChecked(layout.id == active)
+            return
+
+        # Layouts were added/removed/renamed-by-id — safe to rebuild here,
+        # since that only ever originates from the profile dialog.
+        self._clear_layout_menu()
+        for index, layout in enumerate(game.layouts.values()):
+            action = QAction(self._layout_menu_text(layout), self.menu_layouts, checkable=True)
+            action.setData(layout.id)
+            action.setChecked(layout.id == active)
+            if index < 9:  # Ctrl+1..9 for the first few layouts
+                action.setShortcut(f"Ctrl+{index + 1}")
+            action.triggered.connect(lambda _c, lid=layout.id: self._switch_layout(lid))
+            self._layout_group.addAction(action)
+            self.menu_layouts.addAction(action)
+        self._layout_menu_ids = list(game.layouts)
+
+    def _clear_layout_menu(self) -> None:
+        # Detach from the group BEFORE clearing: the menu owns these actions
+        # and clear() destroys them, which would leave the group dangling.
+        for action in self._layout_group.actions():
+            self._layout_group.removeAction(action)
+        self.menu_layouts.clear()
+        self._layout_menu_ids = []
+
+    def _switch_layout(self, layout_id: str) -> None:
+        if layout_id == self.profile_manager.active_layout_id:
+            return
+        self.profile_manager.set_active_layout(layout_id)
+        self.statusBar().showMessage(
+            f"Layout: {self.profile_manager.active_layout.name}", 4000
+        )
+
+    def _open_profile_dialog(self) -> None:
+        ProfileDialog(self.profile_manager, self.input_thread, self).exec()
 
     # -- wiring --------------------------------------------------------------------
 
@@ -477,7 +590,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded video: {Path(path).name}", 5000)
 
     def _open_controller_test(self) -> None:
-        ControllerTestDialog(self.input_thread, self).exec()
+        ControllerTestDialog(
+            self.input_thread, self.profile_manager.active_device, self
+        ).exec()
 
     def _open_video_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -503,8 +618,18 @@ class MainWindow(QMainWindow):
         self.mode_controller.combo_loaded = True
         self.act_save_combo.setEnabled(True)
         self.player.load(combo.video_path)
+
+        # A combo file names its character; if a layout is bound to that
+        # character, switch to it so practice runs on the right bindings.
+        switched = self.profile_manager.activate_character(combo.character)
+        note = (
+            f"  ·  layout → {self.profile_manager.active_layout.name}"
+            if switched
+            else ""
+        )
         self.statusBar().showMessage(
-            f"Loaded combo '{combo.combo_name}' ({len(combo.inputs)} inputs)", 5000
+            f"Loaded combo '{combo.combo_name}' ({len(combo.inputs)} inputs){note}",
+            5000,
         )
 
     def _save_combo_dialog(self) -> None:
@@ -560,6 +685,13 @@ class MainWindow(QMainWindow):
             if choice is QMessageBox.StandardButton.No:
                 event.ignore()
                 return
+        if self.profile_manager.is_dirty:
+            # Bindings are cheap to persist and expensive to redo: save them
+            # silently rather than prompting on the way out.
+            try:
+                self.profile_manager.save()
+            except OSError as exc:
+                print(f"Could not save profiles: {exc}", file=sys.stderr)
         self.input_thread.stop()
         self.player.shutdown()
         event.accept()

@@ -2,22 +2,37 @@
 input_engine.py — Dedicated XInput polling thread.
 
 Runs a ~250 Hz loop on a QThread, completely independent of Qt's event loop
-and window focus. On every attack-button rising edge it:
+and window focus. On every rising edge of a bound action button it:
 
   1. stamps the press with the current video frame (FrameClock),
-  2. runs the motion parser over the direction ring buffer,
-  3. emits a finished InputEvent via a queued Qt signal.
+  2. runs the motion parser over the direction ring buffer (unless the bound
+     logical input is a single-button motion input),
+  3. emits a finished InputEvent via a queued Qt signal — one per logical
+     input, so a macro binding produces several events from one switch.
+
+Rebinding
+---------
+The loop owns no mapping of its own. It reads a `ResolvedProfile`
+(`profiles.py`) — a flat, immutable source→action table derived from the
+active game profile + layout + device. The GUI thread rebinds by building a
+new ResolvedProfile and calling `set_profile()`; that is a single attribute
+assignment, atomic in CPython, so no lock is needed and the change takes
+effect on the very next poll. The loop notices the swap by identity and
+clears its edge state so a held button can't fire a phantom press under its
+new binding.
+
+Directions never travel the button path: they are OR-ed from whichever
+sources the profile binds to each cardinal, SOCD-cleaned, then pushed to the
+motion parser's ring buffer.
 
 Pad selection: by default the thread auto-locks to the first connected
 XInput slot; the controller-test dialog can pin a specific slot with
 `set_pad_index(0..3)` or return to auto with `set_pad_index(None)`.
 
-Monitor mode: while the controller-test dialog is open it calls
-`set_monitoring(True)`, and the thread additionally emits ~30 Hz
-PadSnapshot lists for ALL four slots so the dialog can render live state
+Monitor mode: while the controller-test / rebinding dialogs are open they
+call `set_monitoring(True)`, and the thread additionally emits ~30 Hz
+PadSnapshot lists for ALL four slots so those dialogs can render live state
 without touching XInput from a second thread.
-
-D-pad only (leverless-friendly), with configurable SOCD cleaning.
 """
 
 from __future__ import annotations
@@ -30,13 +45,13 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from .frame_clock import FrameClock
 from .models import Button, Motion
 from .motion_parser import (
-    SOCD_NEUTRAL,
     DirectionRingBuffer,
     ParserConfig,
     clean_socd,
     mirror_direction,
     parse_motion,
 )
+from .profiles import TRIGGER_SOURCES, ResolvedProfile
 
 try:  # XInput-Python is Windows-only; keep the module importable elsewhere.
     import XInput  # type: ignore
@@ -44,36 +59,50 @@ except Exception:  # pragma: no cover
     XInput = None
 
 
-DEFAULT_BUTTON_MAP: dict[str, Button] = {
-    "X": Button.LIGHT,
-    "Y": Button.MEDIUM,
-    "B": Button.HEAVY,
-    "A": Button.SPECIAL,
-    "LEFT_SHOULDER": Button.ASSIST1,
-    "RIGHT_SHOULDER": Button.ASSIST2,
-    "RIGHT_TRIGGER": Button.TAG,
-    "LEFT_TRIGGER": Button.THROW,
-}
 TRIGGER_THRESHOLD = 0.5
 POLL_INTERVAL_S = 0.004  # ~250 Hz
 MONITOR_INTERVAL_S = 1 / 30  # snapshot rate for the test dialog
 NUM_SLOTS = 4
 
 
+def default_profile() -> ResolvedProfile:
+    """Marvel Tōkon on the stock 16-button leverless — used until the
+    ProfileManager pushes the user's own active profile in."""
+    from .games import leverless_16, marvel_tokon  # local: avoid import cycle
+
+    game = marvel_tokon()
+    return ResolvedProfile.resolve(
+        game, game.require_layout(game.default_layout_id), leverless_16()
+    )
+
+
+#: Back-compat view of the shipped default binding, in the old
+#: `{XInput source: Button}` shape. Read-only — rebind through ProfileManager.
+DEFAULT_BUTTON_MAP: dict[str, Button] = default_profile().button_map()
+
+
 @dataclass(frozen=True)
 class InputEvent:
-    """A confirmed attack-button press, fully resolved."""
+    """A confirmed action-button press, fully resolved."""
 
     frame: int
     button: Button
-    motion: Motion  # Motion.NONE == bare button / Quick Special
+    motion: Motion  # Motion.NONE == bare button / single-button motion input
     direction: int  # numpad direction held at press time
     t_monotonic: float
+    logical_id: str = ""    # e.g. "QUICK_SKILL" — the game's own vocabulary
+    logical_name: str = ""  # e.g. "Quick Skill" — display text
+    source: str = ""        # raw XInput token that fired it
+    macro: bool = False     # True when one switch fired several inputs
+
+    @property
+    def display_name(self) -> str:
+        return self.logical_name or self.button.value
 
 
 @dataclass(frozen=True)
 class PadSnapshot:
-    """Raw live state of one XInput slot, for the controller-test dialog."""
+    """Raw live state of one XInput slot, for the controller/rebind dialogs."""
 
     index: int
     connected: bool
@@ -81,6 +110,14 @@ class PadSnapshot:
     lt: float = 0.0
     rt: float = 0.0
     direction: int = 5  # SOCD-cleaned numpad (facing mirror NOT applied)
+
+    def pressed(self, source: str) -> bool:
+        """Uniform read for any XInput source, triggers included."""
+        if source == "LEFT_TRIGGER":
+            return self.lt >= TRIGGER_THRESHOLD
+        if source == "RIGHT_TRIGGER":
+            return self.rt >= TRIGGER_THRESHOLD
+        return bool(self.buttons.get(source, False))
 
     @property
     def any_pressed(self) -> bool:
@@ -98,25 +135,25 @@ class InputThread(QThread):
     connected_changed = pyqtSignal(bool)
     active_pad_changed = pyqtSignal(int)  # slot index, -1 = none
     monitor_state = pyqtSignal(object)  # list[PadSnapshot], all 4 slots
+    raw_press = pyqtSignal(str)  # XInput source token — drives press-to-bind
     error = pyqtSignal(str)
 
     def __init__(
         self,
         frame_clock: FrameClock,
-        button_map: dict[str, Button] | None = None,
-        socd_mode: str = SOCD_NEUTRAL,
+        profile: ResolvedProfile | None = None,
         parser_config: ParserConfig = ParserConfig(),
     ) -> None:
         super().__init__()
         self._clock = frame_clock
-        self._button_map = dict(button_map or DEFAULT_BUTTON_MAP)
-        self._socd_mode = socd_mode
+        self._profile = profile or default_profile()
         self._parser_config = parser_config
         self._buffer = DirectionRingBuffer(maxlen=64)
         self._running = False
         # Flags below are single-word writes from the GUI thread: no lock needed.
         self._facing_right = True
         self._monitoring = False
+        self._listening = False
         self._pad_override: int | None = None
         self._last_monitor = 0.0
 
@@ -132,13 +169,27 @@ class InputThread(QThread):
     def set_monitoring(self, enabled: bool) -> None:
         self._monitoring = enabled
 
+    def set_listening(self, enabled: bool) -> None:
+        """While listening, every raw source edge is echoed on `raw_press`
+        so the rebinding dialog can capture 'press the button you want'."""
+        self._listening = enabled
+
     def set_pad_index(self, index: int | None) -> None:
         """Pin a specific XInput slot (0-3), or None for auto (first found)."""
         self._pad_override = index
 
+    def set_profile(self, profile: ResolvedProfile) -> None:
+        """Swap the active binding table. Safe from the GUI thread mid-poll."""
+        self._profile = profile
+
+    @property
+    def profile(self) -> ResolvedProfile:
+        return self._profile
+
     @property
     def button_map(self) -> dict[str, Button]:
-        return dict(self._button_map)
+        """Back-compat: `{XInput source: Button}` for the active profile."""
+        return self._profile.button_map()
 
     @property
     def available(self) -> bool:
@@ -153,9 +204,37 @@ class InputThread(QThread):
             return override if ok else None
         return next((i for i, ok in enumerate(connected) if ok), None)
 
+    # -- source reads ----------------------------------------------------------
+
+    @staticmethod
+    def _read_sources(
+        sources: tuple[str, ...], buttons: dict, lt: float, rt: float
+    ) -> dict[str, bool]:
+        """Sample exactly the sources the active profile cares about."""
+        trigger_values = {"LEFT_TRIGGER": lt, "RIGHT_TRIGGER": rt}
+        return {
+            src: (
+                trigger_values[src] >= TRIGGER_THRESHOLD
+                if src in TRIGGER_SOURCES
+                else bool(buttons.get(src, False))
+            )
+            for src in sources
+        }
+
+    def _direction_from(self, profile: ResolvedProfile, pressed: dict[str, bool]) -> int:
+        """OR each cardinal across every source bound to it, then SOCD-clean.
+        Duplicate direction keys (two Up buttons) merge here for free."""
+        return clean_socd(
+            up=any(pressed.get(s, False) for s in profile.up_sources),
+            down=any(pressed.get(s, False) for s in profile.down_sources),
+            left=any(pressed.get(s, False) for s in profile.left_sources),
+            right=any(pressed.get(s, False) for s in profile.right_sources),
+            mode=profile.socd_mode,
+        )
+
     # -- monitor snapshots ------------------------------------------------------
 
-    def _maybe_emit_monitor(self, now: float) -> None:
+    def _maybe_emit_monitor(self, now: float, profile: ResolvedProfile) -> None:
         if now - self._last_monitor < MONITOR_INTERVAL_S:
             return
         self._last_monitor = now
@@ -172,14 +251,15 @@ class InputThread(QThread):
                 state = XInput.get_state(i)
                 buttons = XInput.get_button_values(state)
                 lt, rt = XInput.get_trigger_values(state)
-                direction = clean_socd(
-                    up=buttons.get("DPAD_UP", False),
-                    down=buttons.get("DPAD_DOWN", False),
-                    left=buttons.get("DPAD_LEFT", False),
-                    right=buttons.get("DPAD_RIGHT", False),
-                    mode=self._socd_mode,
+                pressed = self._read_sources(
+                    profile.direction_sources, buttons, lt, rt
                 )
-                snaps.append(PadSnapshot(i, True, dict(buttons), lt, rt, direction))
+                snaps.append(
+                    PadSnapshot(
+                        i, True, dict(buttons), lt, rt,
+                        self._direction_from(profile, pressed),
+                    )
+                )
             except Exception:
                 snaps.append(PadSnapshot(index=i, connected=False))
         self.monitor_state.emit(snaps)
@@ -199,12 +279,27 @@ class InputThread(QThread):
         last_scan = 0.0
         last_packet = -1
         prev_pressed: dict[str, bool] = {}
+        profile = self._profile
+        # Sources the profile binds, plus every source while listening for a
+        # rebind (an unbound switch has to be capturable to be bindable).
+        watched = profile.sources
+        prev_raw: dict[str, bool] = {}
 
         while self._running:
             now = time.monotonic()
 
+            # -- pick up a rebind pushed from the GUI thread -------------------
+            current = self._profile
+            if current is not profile:
+                profile = current
+                watched = profile.sources
+                # Drop edge state: a switch held across the swap must not fire
+                # its new binding until it is physically released and pressed.
+                prev_pressed.clear()
+                self._buffer.clear()
+
             if self._monitoring:
-                self._maybe_emit_monitor(now)
+                self._maybe_emit_monitor(now, profile)
 
             # -- (re)select the active pad -------------------------------------
             override = self._pad_override
@@ -221,6 +316,7 @@ class InputThread(QThread):
                         pad = new_pad
                         last_packet = -1
                         prev_pressed.clear()
+                        prev_raw.clear()
                         self._buffer.clear()
                         self.connected_changed.emit(pad is not None)
                         self.active_pad_changed.emit(pad if pad is not None else -1)
@@ -243,42 +339,55 @@ class InputThread(QThread):
 
             buttons = XInput.get_button_values(state)
             lt, rt = XInput.get_trigger_values(state)
+            pressed_now = self._read_sources(watched, buttons, lt, rt)
 
-            # -- directions (d-pad only, SOCD-cleaned, facing-mirrored) --------
-            direction = clean_socd(
-                up=buttons.get("DPAD_UP", False),
-                down=buttons.get("DPAD_DOWN", False),
-                left=buttons.get("DPAD_LEFT", False),
-                right=buttons.get("DPAD_RIGHT", False),
-                mode=self._socd_mode,
-            )
+            # -- press-to-bind capture (rebinding dialog only) -----------------
+            if self._listening:
+                raw = self._read_sources(
+                    tuple(buttons) + ("LEFT_TRIGGER", "RIGHT_TRIGGER"), buttons, lt, rt
+                )
+                for src, down in raw.items():
+                    if down and not prev_raw.get(src, False):
+                        self.raw_press.emit(src)
+                prev_raw = raw
+            elif prev_raw:
+                prev_raw = {}
+
+            # -- directions (SOCD-cleaned, facing-mirrored) --------------------
+            direction = self._direction_from(profile, pressed_now)
             if not self._facing_right:
                 direction = mirror_direction(direction)
             if self._buffer.push(now, direction):
                 self.direction_changed.emit(direction)
 
-            # -- attack buttons: rising edges only (no negative edge in Tōkon) -
-            pressed_now: dict[str, bool] = {
-                name: bool(buttons.get(name, False))
-                for name in self._button_map
-                if not name.endswith("_TRIGGER")
-            }
-            pressed_now["LEFT_TRIGGER"] = lt >= TRIGGER_THRESHOLD
-            pressed_now["RIGHT_TRIGGER"] = rt >= TRIGGER_THRESHOLD
-
-            for name, mapped in self._button_map.items():
-                if pressed_now.get(name, False) and not prev_pressed.get(name, False):
-                    frame = self._clock.current_frame()
-                    motion = parse_motion(
-                        self._buffer.samples, now, self._parser_config
-                    )
+            # -- action buttons: rising edges only (no negative edge in Tōkon) -
+            motion: Motion | None = None  # parsed at most once per poll
+            for source, actions in profile.actions.items():
+                if not pressed_now.get(source, False) or prev_pressed.get(source, False):
+                    continue
+                frame = self._clock.current_frame()
+                is_macro = len(actions) > 1
+                for action in actions:
+                    if action.parse_motions:
+                        if motion is None:
+                            motion = parse_motion(
+                                self._buffer.samples, now, self._parser_config
+                            )
+                        resolved_motion = motion
+                    else:
+                        # Single-button motion input: the button IS the motion.
+                        resolved_motion = Motion.NONE
                     self.input_event.emit(
                         InputEvent(
                             frame=frame,
-                            button=mapped,
-                            motion=motion,
+                            button=action.button,
+                            motion=resolved_motion,
                             direction=direction,
                             t_monotonic=now,
+                            logical_id=action.logical_id,
+                            logical_name=action.logical_name,
+                            source=source,
+                            macro=is_macro,
                         )
                     )
             prev_pressed = pressed_now

@@ -5,10 +5,14 @@ Three jobs:
   1. Show all four XInput slots live, so the user can confirm which slot
      their device occupies ("press any button — its slot pulses").
   2. Let them pin that slot (or Auto) for the InputThread.
-  3. Verify the FULL pipeline: raw d-pad state, SOCD-cleaned numpad
-     direction, lit buttons/triggers with their game-button mapping, and
-     the last fully parsed InputEvent (e.g. "SPECIAL (QCF)") — proving
-     that motions register off the leverless before entering Record mode.
+  3. Verify the FULL pipeline: raw switch state, SOCD-cleaned numpad
+     direction, and the last fully parsed InputEvent (e.g. "Quick Skill" or
+     "Heavy (↓↘→ QCF)") — proving that the active profile's bindings and the
+     motion parser both fire off the leverless before entering Record mode.
+
+The switch grid is driven by the ACTIVE PROFILE, not a hardcoded pad layout:
+each of the box's 16 silkscreened switches is listed with the logical input
+it currently fires, so this doubles as a printout of the current layout.
 
 The dialog never touches XInput itself. It flips the InputThread into
 monitor mode and renders the ~30 Hz PadSnapshot stream it emits, so all
@@ -41,7 +45,8 @@ from .input_engine import (
     PadSnapshot,
 )
 from .models import Motion
-from .timeline import BUTTON_LABELS, MOTION_GLYPHS
+from .profiles import DeviceLayout
+from .timeline import MOTION_GLYPHS
 
 _CHIP_ON = (
     "QLabel { background: #3fae6a; color: #0a0a0e; border-radius: 6px;"
@@ -51,27 +56,34 @@ _CHIP_OFF = (
     "QLabel { background: #26262e; color: #9a9aa4; border-radius: 6px;"
     " padding: 4px 8px; }"
 )
+_CHIP_UNMAPPED = (
+    "QLabel { background: #1b1b22; color: #55555f; border-radius: 6px;"
+    " padding: 4px 8px; font-style: italic; }"
+)
 _CELL_ON = (
     "QLabel { background: #29b6f6; color: #0a0a0e; border: 1px solid #444;"
     " font-weight: bold; }"
 )
 _CELL_OFF = "QLabel { background: #1b1b22; color: #55555f; border: 1px solid #333; }"
 
-_PAD_BUTTONS = ("A", "B", "X", "Y", "LEFT_SHOULDER", "RIGHT_SHOULDER", "START", "BACK")
-_SHORT = {"LEFT_SHOULDER": "LB", "RIGHT_SHOULDER": "RB", "START": "ST", "BACK": "BK"}
-
 # Numpad layout rows for the 3x3 direction grid (top row first).
 _NUMPAD_ROWS = ((7, 8, 9), (4, 5, 6), (1, 2, 3))
 
 
 class ControllerTestDialog(QDialog):
-    def __init__(self, input_thread: InputThread, parent=None) -> None:
+    def __init__(
+        self,
+        input_thread: InputThread,
+        device: DeviceLayout | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Controller Test")
         self.setModal(True)
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(620)
 
         self._thread = input_thread
+        self._device = device
         self._active_pad = -1  # thread's current slot (auto mode display)
         self._snapshots: list[PadSnapshot] = []
         self._last_event_t = 0.0
@@ -127,7 +139,8 @@ class ControllerTestDialog(QDialog):
         root.addWidget(slot_box)
 
         # Live input ----------------------------------------------------------------
-        live_box = QGroupBox("Live input (selected slot)")
+        profile = self._thread.profile
+        live_box = QGroupBox(f"Live input — {profile.title}")
         live_lay = QHBoxLayout(live_box)
 
         dpad_col = QVBoxLayout()
@@ -148,28 +161,26 @@ class ControllerTestDialog(QDialog):
         dpad_col.addStretch(1)
         live_lay.addLayout(dpad_col)
 
+        # One chip per physical switch, labelled with what it currently fires.
         btn_col = QVBoxLayout()
         chip_grid = QGridLayout()
         chip_grid.setSpacing(6)
-        self._chips: dict[str, QLabel] = {}
-        button_map = self._thread.button_map
-        for idx, name in enumerate(_PAD_BUTTONS):
-            mapped = button_map.get(name)
-            text = _SHORT.get(name, name)
-            if mapped is not None:
-                text += f" → {BUTTON_LABELS[mapped]}"
+        self._chips: dict[str, QLabel] = {}  # XInput source -> chip
+        self._unmapped: set[str] = set()
+        for idx, source, text in self._switch_rows():
             chip = QLabel(text)
-            chip.setStyleSheet(_CHIP_OFF)
+            chip.setStyleSheet(_CHIP_OFF if source not in self._unmapped else _CHIP_UNMAPPED)
             chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._chips[name] = chip
+            self._chips[source] = chip
             chip_grid.addWidget(chip, idx // 2, idx % 2)
         btn_col.addLayout(chip_grid)
 
-        for trig, label in (("LEFT_TRIGGER", "LT"), ("RIGHT_TRIGGER", "RT")):
+        # Analog trigger readout: leverless triggers are digital switches, but
+        # a pad's analog travel is worth seeing against TRIGGER_THRESHOLD.
+        for source, label in (("LEFT_TRIGGER", "LT"), ("RIGHT_TRIGGER", "RT")):
             row = QHBoxLayout()
-            mapped = button_map.get(trig)
-            suffix = f" → {BUTTON_LABELS[mapped]}" if mapped is not None else ""
-            row.addWidget(QLabel(f"{label}{suffix}"))
+            bound = profile.label_for(source)
+            row.addWidget(QLabel(f"{label}{f' → {bound}' if bound else ''}"))
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setTextVisible(False)
@@ -181,13 +192,15 @@ class ControllerTestDialog(QDialog):
         root.addWidget(live_box)
 
         # Pipeline check --------------------------------------------------------------
-        pipe_box = QGroupBox("Pipeline check (button map + motion parser)")
+        pipe_box = QGroupBox("Pipeline check (bindings + motion parser)")
         pipe_lay = QVBoxLayout(pipe_box)
         self._event_label = QLabel("Waiting for a button press…")
         self._event_label.setStyleSheet("font-size: 15px; font-weight: bold;")
         pipe_lay.addWidget(self._event_label)
         tip = QLabel(
-            "Try a QCF + button: you should see e.g.  SPECIAL (↓↘→ QCF).\n"
+            "Try a QCF + Heavy: you should see  Heavy (↓↘→ QCF).\n"
+            "Quick Skill / Quick Assemble / Quick Dash always read as bare "
+            "presses — the button IS the motion.\n"
             "Note: 'Facing Left' mirroring from the Mode menu applies here too."
         )
         tip.setStyleSheet("color: #9a9aa4;")
@@ -198,6 +211,26 @@ class ControllerTestDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         root.addWidget(buttons)
+
+    def _switch_rows(self) -> list[tuple[int, str, str]]:
+        """(grid index, XInput source, chip text) for every switch on the box.
+
+        Falls back to the profile's bound sources when no device layout was
+        supplied, so the dialog still works standalone.
+        """
+        profile = self._thread.profile
+        rows: list[tuple[int, str, str]] = []
+        if self._device is not None:
+            for idx, btn in enumerate(self._device):
+                bound = profile.label_for(btn.source)
+                if not bound:
+                    self._unmapped.add(btn.source)
+                    bound = "unmapped"
+                rows.append((idx, btn.source, f"{btn.label} → {bound}"))
+        else:
+            for idx, source in enumerate(profile.sources):
+                rows.append((idx, source, f"{source} → {profile.label_for(source)}"))
+        return rows
 
     # -- slot selection -----------------------------------------------------------------
 
@@ -238,29 +271,38 @@ class ControllerTestDialog(QDialog):
         self._render_live(snap)
 
     def _render_live(self, snap: PadSnapshot | None) -> None:
-        direction = snap.direction if snap and snap.connected else 5
+        live = snap if snap and snap.connected else None
+
+        direction = live.direction if live else 5
         for d, cell in self._dir_cells.items():
             cell.setStyleSheet(_CELL_ON if d == direction else _CELL_OFF)
         self._dir_label.setText(f"D-pad (SOCD-cleaned): {direction}")
 
-        buttons = snap.buttons if snap and snap.connected else {}
-        for name, chip in self._chips.items():
-            chip.setStyleSheet(_CHIP_ON if buttons.get(name, False) else _CHIP_OFF)
+        for source, chip in self._chips.items():
+            if live is not None and live.pressed(source):
+                chip.setStyleSheet(_CHIP_ON)
+            elif source in self._unmapped:
+                chip.setStyleSheet(_CHIP_UNMAPPED)
+            else:
+                chip.setStyleSheet(_CHIP_OFF)
 
-        lt = snap.lt if snap and snap.connected else 0.0
-        rt = snap.rt if snap and snap.connected else 0.0
-        self._bar_lt.setValue(int(lt * 100))
-        self._bar_rt.setValue(int(rt * 100))
+        self._bar_lt.setValue(int((live.lt if live else 0.0) * 100))
+        self._bar_rt.setValue(int((live.rt if live else 0.0) * 100))
 
     # -- pipeline readout --------------------------------------------------------------------
 
     def _on_input_event(self, ev: InputEvent) -> None:
         self._last_event_t = time.monotonic()
-        if ev.motion is Motion.NONE:
-            text = f"{ev.button.value}   (bare press / Quick Special)"
-        else:
+        text = ev.display_name
+        if ev.motion is not Motion.NONE:
             glyph = MOTION_GLYPHS.get(ev.motion, "")
-            text = f"{ev.button.value}   ({glyph} {ev.motion.value})"
+            text += f"   ({glyph} {ev.motion.value})"
+        else:
+            text += "   (bare press)"
+        if ev.macro:
+            text += "   [macro]"
+        if ev.source:
+            text += f"   ← {ev.source}"
         self._event_label.setText(text)
         self._event_label.setStyleSheet(
             "font-size: 15px; font-weight: bold; color: #6ee87e;"

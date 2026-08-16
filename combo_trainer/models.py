@@ -77,18 +77,35 @@ class Motion(str, Enum):
 
 class Button(str, Enum):
     """
-    Attack / system buttons. Kept deliberately generic and editable:
-    Tōkon's final button nomenclature can be remapped in one place here
-    (plus icon assets) without touching the schema or any other module.
+    Attack / system buttons — the engine-level domain that combo JSON,
+    the timeline renderer and the practice matcher all speak.
+
+    This is NOT the rebinding layer. Which physical switch produces which
+    Button is decided by `profiles.InputProfile`; a game's own naming (Tōkon
+    calls its assist "Assemble") lives in `profiles.LogicalInput`. Adding a
+    game therefore only means adding entries here if it needs a genuinely new
+    icon/colour — everything else is data.
+
+    Directions are deliberately absent: they travel the SOCD + motion-parser
+    pipeline and never become a Button.
     """
+    # -- Marvel Tōkon: Fighting Souls -------------------------------------
     LIGHT = "LIGHT"
     MEDIUM = "MEDIUM"
     HEAVY = "HEAVY"
+    UNIQUE = "UNIQUE"               # 4th attack button
+    ASSEMBLE = "ASSEMBLE"           # call partner / assist
+    QUICK_SKILL = "QUICK_SKILL"     # single-button motion special
+    QUICK_ASSEMBLE = "QUICK_ASSEMBLE"
+    QUICK_DASH = "QUICK_DASH"
+    THROW = "THROW"
+
+    # -- legacy values -----------------------------------------------------
+    # Kept so combo JSONs recorded before the profile system still load.
     SPECIAL = "SPECIAL"     # dedicated special / Quick Special button
     ASSIST1 = "ASSIST1"
     ASSIST2 = "ASSIST2"
     TAG = "TAG"
-    THROW = "THROW"
 
 
 class Judgement(str, Enum):

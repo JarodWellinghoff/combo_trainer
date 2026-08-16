@@ -35,24 +35,36 @@ HIT_ZONE_X_FRAC = 0.18
 ICON_RADIUS = 24
 
 BUTTON_COLORS: dict[Button, QColor] = {
+    # Marvel Tōkon
     Button.LIGHT: QColor(90, 170, 255),
     Button.MEDIUM: QColor(250, 200, 60),
     Button.HEAVY: QColor(240, 80, 80),
+    Button.UNIQUE: QColor(190, 120, 255),
+    Button.ASSEMBLE: QColor(255, 140, 60),
+    Button.QUICK_SKILL: QColor(90, 230, 130),
+    Button.QUICK_ASSEMBLE: QColor(255, 190, 120),
+    Button.QUICK_DASH: QColor(120, 200, 255),
+    Button.THROW: QColor(170, 170, 180),
+    # Legacy values (pre-profile combo files)
     Button.SPECIAL: QColor(90, 230, 130),
     Button.ASSIST1: QColor(190, 120, 255),
     Button.ASSIST2: QColor(255, 140, 60),
     Button.TAG: QColor(80, 220, 220),
-    Button.THROW: QColor(170, 170, 180),
 }
 BUTTON_LABELS: dict[Button, str] = {
     Button.LIGHT: "L",
     Button.MEDIUM: "M",
     Button.HEAVY: "H",
+    Button.UNIQUE: "U",
+    Button.ASSEMBLE: "AS",
+    Button.QUICK_SKILL: "QS",
+    Button.QUICK_ASSEMBLE: "QA",
+    Button.QUICK_DASH: "QD",
+    Button.THROW: "TH",
     Button.SPECIAL: "S",
     Button.ASSIST1: "A1",
     Button.ASSIST2: "A2",
     Button.TAG: "TAG",
-    Button.THROW: "TH",
 }
 MOTION_GLYPHS: dict[Motion, str] = {
     Motion.QCF: "↓↘→",
@@ -136,7 +148,7 @@ class TimelineOverlay(QWidget):
             {
                 "kind": "popup",
                 "t0": time.monotonic(),
-                "text": f"REC {BUTTON_LABELS[entry.button]}",
+                "text": f"REC {BUTTON_LABELS.get(entry.button, entry.button.value)}",
                 "color": QColor(255, 90, 90),
             }
         )
@@ -218,7 +230,7 @@ class TimelineOverlay(QWidget):
                     ICON_RADIUS * 2,
                 ),
                 Qt.AlignmentFlag.AlignCenter,
-                BUTTON_LABELS[note.button],
+                BUTTON_LABELS.get(note.button, note.button.value[:2]),
             )
 
             if note.motion is not Motion.NONE:
