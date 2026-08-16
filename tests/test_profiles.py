@@ -138,18 +138,19 @@ class TestTokonDefaultLayout(unittest.TestCase):
         self.assertEqual(self.validation.unknown_bindings, {})
         self.assertTrue(self.validation.ok)
 
-    def test_three_leftovers_handled_three_ways(self):
+    def test_three_leftovers_put_to_three_different_uses(self):
         # duplicate
         self.assertEqual(self.layout.logical_for("AUX2"), ("UP",))
         self.assertEqual(
             set(self.validation.duplicate_inputs["UP"]), {"UP", "AUX2"}
         )
-        # macro
+        # action macro
         self.assertEqual(self.layout.logical_for("AUX3"), ("LIGHT", "MEDIUM"))
         self.assertTrue(self.layout.is_macro("AUX3"))
-        # unmapped
-        self.assertEqual(self.layout.logical_for("AUX4"), ())
-        self.assertEqual(self.validation.unbound_buttons, ("AUX4",))
+        # Command Normal: direction + attack, one switch
+        self.assertEqual(self.layout.logical_for("AUX4"), ("DOWN", "HEAVY"))
+        self.assertTrue(self.layout.is_macro("AUX4"))  # still a multi-input binding
+        self.assertEqual(self.validation.unbound_buttons, ())  # nothing left inert
 
     def test_resolution_splits_directions_from_actions(self):
         r = ResolvedProfile.resolve(self.game, self.layout, self.device)
@@ -172,9 +173,13 @@ class TestTokonDefaultLayout(unittest.TestCase):
         self.assertEqual([a.button for a in actions], [Button.LIGHT, Button.MEDIUM])
         self.assertEqual(r.label_for("BACK"), "Light + Medium")
 
-    def test_unmapped_switch_resolves_to_nothing(self):
-        r = ResolvedProfile.resolve(self.game, self.layout, self.device)
-        self.assertNotIn("START", r.actions)  # AUX4
+    def test_unbound_switch_resolves_to_nothing(self):
+        """A switch with no binding at all contributes nothing, regardless of
+        which specific switch that happens to be on the shipped layout."""
+        layout = InputProfile(id="mostly_default", name="x", bindings=dict(self.layout.bindings))
+        layout.clear_binding("AUX4")  # the shipped layout's only remaining free slot to test with
+        r = ResolvedProfile.resolve(self.game, layout, self.device)
+        self.assertNotIn("START", r.actions)
         self.assertNotIn("START", r.sources)
         self.assertEqual(r.label_for("START"), "")
 
@@ -203,6 +208,70 @@ class TestTokonDefaultLayout(unittest.TestCase):
         r = ResolvedProfile.resolve(self.game, self.layout, self.device)
         self.assertEqual(r.button_map()["X"], Button.LIGHT)
         self.assertEqual(r.button_map()["BACK"], Button.LIGHT)  # macro: first only
+
+
+class TestCommandNormal(unittest.TestCase):
+    """AUX4's Down+Heavy binding: a single switch pairing a direction with an
+    attack, resolved instantly (same frame, no ring-buffer lookback)."""
+
+    def setUp(self):
+        self.game = marvel_tokon()
+        self.device = leverless_16()
+        self.layout = self.game.require_layout("default")
+        self.r = ResolvedProfile.resolve(self.game, self.layout, self.device)
+
+    def test_action_is_flagged_command_normal(self):
+        heavy = self.r.actions["START"][0]  # AUX4
+        self.assertEqual(heavy.button, Button.HEAVY)
+        self.assertTrue(heavy.command_normal)
+
+    def test_plain_binding_of_the_same_button_is_unaffected(self):
+        """T3 is plain Heavy, no direction — must NOT pick up the flag just
+        because AUX4 also fires Button.HEAVY elsewhere."""
+        heavy = self.r.actions["RIGHT_SHOULDER"][0]  # T3
+        self.assertEqual(heavy.button, Button.HEAVY)
+        self.assertFalse(heavy.command_normal)
+
+    def test_direction_half_still_joins_the_ambient_socd_pool(self):
+        """The Down half isn't swallowed by being paired with an action — it
+        behaves exactly like a second physical Down button."""
+        self.assertIn("START", self.r.down_sources)
+
+    def test_release_of_the_macro_button_does_not_drop_a_real_held_down(self):
+        """Regression for Task 3: releasing AUX4 while the real d-pad Down is
+        also held must leave Down asserted — and vice versa. Each source is
+        independently OR-ed every poll tick, so there is no shared state to
+        corrupt on release."""
+
+        def numpad(*held: str) -> int:
+            down = set(held)
+            return clean_socd(
+                up=any(s in down for s in self.r.up_sources),
+                down=any(s in down for s in self.r.down_sources),
+                left=any(s in down for s in self.r.left_sources),
+                right=any(s in down for s in self.r.right_sources),
+                mode=self.r.socd_mode,
+            )
+
+        self.assertEqual(numpad("DPAD_DOWN", "START"), 2)  # both held
+        self.assertEqual(numpad("DPAD_DOWN"), 2)  # AUX4 released, real Down stays
+        self.assertEqual(numpad("START"), 2)  # real Down released, AUX4 stays
+        self.assertEqual(numpad(), 5)  # both released -> neutral, no leftover state
+
+    def test_label_shows_the_paired_direction(self):
+        self.assertEqual(self.r.label_for("START"), "Down + Heavy")
+
+    def test_is_still_a_macro_for_validation_bookkeeping(self):
+        """Two logical ids on one switch is a macro either way; command_normal
+        is an orthogonal, more specific flag layered on top."""
+        v = validate_layout(self.game, self.layout, self.device)
+        self.assertIn("AUX4", v.macros)
+        self.assertEqual(v.macros["AUX4"], ("DOWN", "HEAVY"))
+
+    def test_all_three_shipped_layouts_stay_playable(self):
+        for layout in self.game.layouts.values():
+            with self.subTest(layout=layout.id):
+                self.assertTrue(validate_layout(self.game, layout, self.device).ok)
 
 
 class TestBuiltinLayouts(unittest.TestCase):
@@ -329,7 +398,8 @@ class TestProfileLifecycle(unittest.TestCase):
         self.mgr.bind("AUX4", "QUICK_DASH")
         self.assertEqual(layout.logical_for("T1"), ("LIGHT",))  # inherited
         self.assertEqual(
-            self.mgr.active_game.require_layout("default").logical_for("AUX4"), ()
+            self.mgr.active_game.require_layout("default").logical_for("AUX4"),
+            ("DOWN", "HEAVY"),
         )
 
     def test_duplicate_layout_id_rejected(self):

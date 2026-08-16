@@ -44,7 +44,12 @@ Three layers, so a rebind never touches code:
 A binding is a *list* of logical inputs, which is how 16 switches host 13
 inputs gracefully: `()` unmapped, `(x,)` simple, `(x, y)` macro — and two
 switches may name the same input (a second Up under the other thumb). The
-shipped Marvel Tōkon layout demonstrates all three at once.
+shipped Marvel Tōkon layout demonstrates all three, plus a fourth: AUX4
+binds `(DOWN, HEAVY)` as a **Command Normal** — a single-button crouching
+Heavy / anti-air. Pairing a direction with an attack on the SAME switch
+resolves that attack's `direction` from the press itself and forces
+`motion=NONE`, skipping the ring-buffer motion parser entirely — instant and
+deterministic, no timing window to race (`ResolvedAction.command_normal`).
 
 Directional inputs are not buttons: they are OR-ed across every switch bound
 to that cardinal, SOCD-cleaned, then fed to the motion parser. Quick Skill /

@@ -23,12 +23,15 @@ whose firmware disagrees.
 Marvel Tōkon: 13 logical inputs onto 16 switches
 ------------------------------------------------
 4 directions + 4 attacks + 5 mechanics = 13, leaving 3 switches spare. The
-default layout demonstrates all three ways of handling the leftovers, which
-is the whole point of the binding-as-a-tuple design:
+default layout demonstrates three ways of putting them to use, which is the
+whole point of the binding-as-a-tuple design — a binding is just a tuple of
+logical ids, so nothing stops it from mixing categories:
 
-    AUX2  duplicate  -> a second UP for the right thumb
-    AUX3  macro      -> LIGHT + MEDIUM fired from one switch
-    AUX4  unmapped   -> menu/Start button, deliberately inert in-game
+    AUX2  duplicate        -> a second UP for the right thumb
+    AUX3  action macro     -> LIGHT + MEDIUM fired from one switch
+    AUX4  Command Normal   -> DOWN + HEAVY fired from one switch, instantly:
+                              a single-button anti-air/launcher (see
+                              `profiles.ResolvedAction.command_normal`)
 """
 
 from __future__ import annotations
@@ -132,14 +135,15 @@ def tokon_inputs() -> list[LogicalInput]:
 
 
 def _tokon_default_layout() -> InputProfile:
-    """Standard leverless: 13 inputs, 3 leftovers handled three different ways."""
+    """Standard leverless: 13 inputs, 3 leftovers each put to a different use."""
     return InputProfile(
         id="default",
         name="Standard Leverless",
         socd_mode=SOCD_NEUTRAL,
         notes=(
             "Attacks on the top row, team/skill mechanics on the bottom row. "
-            "AUX2 duplicates Up, AUX3 is an L+M macro, AUX4 is left free."
+            "AUX2 duplicates Up, AUX3 is an L+M macro, AUX4 is a Down+Heavy "
+            "Command Normal (instant anti-air/launcher, no direction held)."
         ),
         bindings={
             "LEFT": ("LEFT",),
@@ -157,8 +161,10 @@ def _tokon_default_layout() -> InputProfile:
             "AUX1": ("QUICK_DASH",),
             # -- the 3 leftover switches ----------------------------------
             "AUX2": ("UP",),                 # duplicate: second Up, right thumb
-            "AUX3": ("LIGHT", "MEDIUM"),     # macro: one press fires both
-            # AUX4 absent from the dict == unmapped (menu button, inert)
+            "AUX3": ("LIGHT", "MEDIUM"),     # action macro: one press fires both
+            "AUX4": ("DOWN", "HEAVY"),       # Command Normal: instant crouching
+            #                                 Heavy, no d-pad hand needed —
+            #                                 see ResolvedAction.command_normal
         },
     )
 

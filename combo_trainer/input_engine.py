@@ -6,9 +6,36 @@ and window focus. On every rising edge of a bound action button it:
 
   1. stamps the press with the current video frame (FrameClock),
   2. runs the motion parser over the direction ring buffer (unless the bound
-     logical input is a single-button motion input),
+     logical input is a single-button motion input, OR the switch is a
+     Command Normal — see below),
   3. emits a finished InputEvent via a queued Qt signal — one per logical
      input, so a macro binding produces several events from one switch.
+
+Command Normals (instant Direction + Attack)
+---------------------------------------------
+A switch bound to a direction AND an action together (e.g. Down + Heavy)
+resolves as `ResolvedAction.command_normal=True` (`profiles.resolve()`). Two
+things follow, both on the SAME poll tick as the switch's rising edge —
+no timer, no lookback window:
+
+  * `direction` already reads correctly. The direction pool is a plain
+    per-cardinal OR over every source bound to that cardinal (see
+    `_direction_from`), computed from `pressed_now` BEFORE the action loop
+    below runs. A Command Normal's own switch is simply one more member of
+    that OR, exactly like a second physical d-pad button, so it needs no
+    special-casing here.
+  * `motion` is forced to `Motion.NONE`, skipping `parse_motion()` entirely.
+    This is the actual bug a Command Normal exposes: a plain attack button
+    parses whatever the 300ms ring-buffer window happens to contain, which
+    is exactly the "timers/sequence delays" a same-frame Command Normal must
+    NOT depend on — the direction came from this exact press, there is
+    nothing to infer.
+
+Release is symmetric and needs no extra bookkeeping: the direction pool is
+recomputed from scratch every poll tick, so releasing the switch just drops
+it from that tick's OR — any OTHER switch still feeding the same cardinal
+(a real d-pad Down held at the same time) keeps it live, and cardinals with
+no more sources revert to neutral on the very next tick.
 
 Rebinding
 ---------
@@ -94,6 +121,7 @@ class InputEvent:
     logical_name: str = ""  # e.g. "Quick Skill" — display text
     source: str = ""        # raw XInput token that fired it
     macro: bool = False     # True when one switch fired several inputs
+    command_normal: bool = False  # True when this switch also bound a direction
 
     @property
     def display_name(self) -> str:
@@ -368,7 +396,13 @@ class InputThread(QThread):
                 frame = self._clock.current_frame()
                 is_macro = len(actions) > 1
                 for action in actions:
-                    if action.parse_motions:
+                    if action.command_normal:
+                        # Direction + Attack, same switch: the direction is
+                        # this exact press, not a guess from recent history.
+                        # No ring-buffer lookback, no timer — deterministic
+                        # Motion.NONE every time.
+                        resolved_motion = Motion.NONE
+                    elif action.parse_motions:
                         if motion is None:
                             motion = parse_motion(
                                 self._buffer.samples, now, self._parser_config
@@ -388,6 +422,7 @@ class InputThread(QThread):
                             logical_name=action.logical_name,
                             source=source,
                             macro=is_macro,
+                            command_normal=action.command_normal,
                         )
                     )
             prev_pressed = pressed_now

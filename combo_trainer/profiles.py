@@ -589,6 +589,15 @@ class ResolvedAction:
     logical_id: str
     logical_name: str
     parse_motions: bool = True
+    #: True when THIS switch's own binding also names a directional input —
+    #: a "Command Normal" (e.g. Down + Heavy on one button). Set per-binding
+    #: at resolve time, never on the shared `LogicalInput`, because the same
+    #: HEAVY can be bound plainly elsewhere (T3) where QCF+Heavy must still
+    #: parse. See `InputThread.run`: when True the motion parser (a 300ms
+    #: history window) is skipped entirely and the note is stamped
+    #: `Motion.NONE` — the direction came from this exact press, not from
+    #: guessing at recent history, so there is nothing to parse or wait on.
+    command_normal: bool = False
 
 
 @dataclass(frozen=True)
@@ -634,18 +643,23 @@ class ResolvedProfile:
         return {src: acts[0].button for src, acts in self.actions.items() if acts}
 
     def label_for(self, source: str) -> str:
+        """e.g. "Up" for a plain direction switch, "Light + Medium" for an
+        action macro, or "Down + Heavy" for a Command Normal — the direction
+        this same switch also feeds, prefixed onto its action name(s)."""
+        dir_names = [
+            dir_name
+            for dir_name, srcs in (
+                ("Up", self.up_sources),
+                ("Down", self.down_sources),
+                ("Left", self.left_sources),
+                ("Right", self.right_sources),
+            )
+            if source in srcs
+        ]
         acts = self.actions.get(source)
         if acts:
-            return " + ".join(a.logical_name for a in acts)
-        for dir_name, srcs in (
-            ("Up", self.up_sources),
-            ("Down", self.down_sources),
-            ("Left", self.left_sources),
-            ("Right", self.right_sources),
-        ):
-            if source in srcs:
-                return dir_name
-        return ""
+            return " + ".join(dir_names + [a.logical_name for a in acts])
+        return " + ".join(dir_names)
 
     @classmethod
     def resolve(
@@ -658,10 +672,18 @@ class ResolvedProfile:
             btn = device.get(physical_id)
             if btn is None:
                 continue  # binding for a switch this device doesn't have: ignore
-            for logical_id in logical_ids:
-                li = game.input(logical_id)
-                if li is None:
-                    continue  # stale binding; validate() surfaces it to the UI
+
+            # Resolve every id THIS switch names before splitting them into
+            # the two global tables below — a Command Normal is only
+            # detectable while a binding's direction(s) and action(s) are
+            # still seen together, as one switch's tuple.
+            bound = [game.input(lid) for lid in logical_ids]
+            bound = [li for li in bound if li is not None]  # stale ids: validate() surfaces them
+            is_command_normal = any(li.is_direction for li in bound) and any(
+                li.is_action for li in bound
+            )
+
+            for li in bound:
                 if li.is_direction:
                     assert li.direction is not None
                     if btn.source not in dirs[li.direction]:
@@ -673,6 +695,7 @@ class ResolvedProfile:
                             logical_id=li.id,
                             logical_name=li.name,
                             parse_motions=li.parse_motions,
+                            command_normal=is_command_normal,
                         )
                     )
                 # SYSTEM inputs resolve to nothing by design.

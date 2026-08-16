@@ -297,6 +297,8 @@ class ControllerTestDialog(QDialog):
         if ev.motion is not Motion.NONE:
             glyph = MOTION_GLYPHS.get(ev.motion, "")
             text += f"   ({glyph} {ev.motion.value})"
+        elif ev.command_normal:
+            text += f"   (Command Normal, dir {ev.direction})"
         else:
             text += "   (bare press)"
         if ev.macro:
