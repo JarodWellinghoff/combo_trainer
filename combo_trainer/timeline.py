@@ -4,16 +4,29 @@ timeline.py — The horizontal rhythm timeline overlay.
 Rendering model
 ---------------
 Icons live in FRAME space. Every repaint (~60 Hz, driven by MainWindow's UI
-clock) reads the FrameClock's extrapolated float frame and places each note:
+clock) reads the FrameClock's extrapolated float frame and places each
+CLUSTER (one or more simultaneous notes) at:
 
-    x = hit_zone_x + (note.frame - current_frame_f) * PX_PER_FRAME
+    x = hit_zone_x + (frame - current_frame_f) * PX_PER_FRAME
 
 Because current_frame_f advances at (fps * playback_speed) frames per real
 second, scroll speed scales with mpv's speed automatically — 0.5x video =
 half scroll speed, with the hit zone alignment preserved exactly.
 
+Simultaneous inputs
+--------------------
+`ComboFile.inputs` stays a flat, frame-sorted list of individual
+`ComboInput` rows — a macro or a genuine multi-button press produces several
+rows at the identical `frame` (see `input_engine.InputThread.run`), it does
+NOT change the schema. `cluster_layout.group_by_key()` recovers "N rows, one
+moment" groups from that list at paint time, and `cluster_layout()` arranges
+each group as a small centered icon grid instead of one icon per row (which
+would draw every simultaneous press on top of the others at the same x).
+
 Feedback effects (hit sparks, judgement popups, record flashes) are short
-lived dicts pruned each frame.
+lived dicts pruned each frame. Record flashes for the same frame merge into
+one popup for the same reason notes cluster: a 3-button press should read
+as one flash, not three stacked on the same spot.
 """
 
 from __future__ import annotations
@@ -25,6 +38,7 @@ from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import QWidget
 
+from .cluster_layout import cluster_layout, group_by_key
 from .controllers import NoteStatus, PracticeController
 from .frame_clock import FrameClock
 from .models import Button, ComboFile, ComboInput, Motion
@@ -33,6 +47,10 @@ PX_PER_FRAME = 8.0
 LANE_HEIGHT = 120
 HIT_ZONE_X_FRAC = 0.18
 ICON_RADIUS = 24
+#: At ICON_RADIUS (single press) the label font is 12pt; smaller cluster
+#: icons scale the same ratio down, floored for legibility.
+ICON_FONT_RATIO = 12.0 / ICON_RADIUS
+ICON_FONT_MIN_PT = 6
 
 BUTTON_COLORS: dict[Button, QColor] = {
     # Marvel Tōkon
@@ -144,11 +162,29 @@ class TimelineOverlay(QWidget):
             self._effects.append({"kind": "spark", "t0": time.monotonic()})
 
     def spawn_record_flash(self, entry: ComboInput) -> None:
+        """
+        One popup per moment, not per press: RecordController emits a
+        `ComboInput` per logical input, so a 3-button press calls this 3
+        times in the same tick. Merge presses sharing `entry.frame` into
+        whichever "REC" popup for that frame is still on screen, so a
+        simultaneous 3-button hit reads as one "REC L+M+QS" flash instead of
+        three flashes stacked unreadably on top of each other.
+        """
+        label = BUTTON_LABELS.get(entry.button, entry.button.value)
+        for effect in reversed(self._effects):
+            if effect.get("group") == "record" and effect.get("frame") == entry.frame:
+                if label not in effect["labels"]:
+                    effect["labels"].append(label)
+                    effect["text"] = "REC " + "+".join(effect["labels"])
+                return
         self._effects.append(
             {
                 "kind": "popup",
+                "group": "record",
+                "frame": entry.frame,
                 "t0": time.monotonic(),
-                "text": f"REC {BUTTON_LABELS.get(entry.button, entry.button.value)}",
+                "labels": [label],
+                "text": f"REC {label}",
                 "color": QColor(255, 90, 90),
             }
         )
@@ -194,58 +230,83 @@ class TimelineOverlay(QWidget):
         min_frame = cur - hit_x / PX_PER_FRAME - 4
         max_frame = cur + (self.width() - hit_x) / PX_PER_FRAME + 4
 
-        for idx, note in enumerate(combo.inputs):
-            if note.frame < min_frame:
+        # combo.inputs is frame-sorted (ComboManager guarantees it), so this
+        # groups every run of simultaneous notes — 1 up to all 16 switches —
+        # into one visual cluster per distinct frame.
+        for frame, idxs in group_by_key(combo.inputs, key=lambda n: n.frame):
+            if frame < min_frame:
                 continue
-            if note.frame > max_frame:
+            if frame > max_frame:
                 break
-            x = hit_x + (note.frame - cur) * PX_PER_FRAME
+            x = hit_x + (frame - cur) * PX_PER_FRAME
 
-            status = NoteStatus.PENDING
-            if self._practice_active and self._practice is not None:
-                status = self._practice.status_at(idx)
+            cells = cluster_layout(len(idxs), ICON_RADIUS)
+            for cell, idx in zip(cells, idxs):
+                note = combo.inputs[idx]
+                status = NoteStatus.PENDING
+                if self._practice_active and self._practice is not None:
+                    status = self._practice.status_at(idx)
+                self._paint_note_icon(p, note, status, x + cell.dx, lane_mid + cell.dy, cell.radius)
 
-            color = BUTTON_COLORS.get(note.button, QColor(200, 200, 200))
-            alpha = 255
-            if status in (NoteStatus.PERFECT, NoteStatus.GOOD):
-                color, alpha = STATUS_COLORS[status], 120  # judged: ghosted
-            elif status is NoteStatus.MISS:
-                color, alpha = STATUS_COLORS[status], 160
-            elif status is NoteStatus.SKIPPED:
-                color, alpha = STATUS_COLORS[status], 80
-
-            c = QColor(color)
-            c.setAlpha(alpha)
-            p.setPen(QPen(QColor(255, 255, 255, alpha), 2))
-            p.setBrush(c)
-            p.drawEllipse(QPointF(x, lane_mid), ICON_RADIUS, ICON_RADIUS)
-
-            p.setFont(self._icon_font)
-            p.setPen(QColor(10, 10, 14, alpha))
-            p.drawText(
-                QRectF(
-                    x - ICON_RADIUS,
-                    lane_mid - ICON_RADIUS,
-                    ICON_RADIUS * 2,
-                    ICON_RADIUS * 2,
-                ),
-                Qt.AlignmentFlag.AlignCenter,
-                BUTTON_LABELS.get(note.button, note.button.value[:2]),
+            # One motion glyph per cluster, not per note: simultaneous notes
+            # that parse a motion all share the single motion resolved for
+            # that poll tick (see InputThread.run), so a second copy would
+            # just overlap the first — pick whichever note carries it.
+            motion_note = next(
+                (combo.inputs[i] for i in idxs if combo.inputs[i].motion is not Motion.NONE),
+                None,
             )
-
-            if note.motion is not Motion.NONE:
+            if motion_note is not None:
                 p.setFont(self._glyph_font)
-                p.setPen(QColor(255, 255, 255, alpha))
+                p.setPen(QColor(255, 255, 255, 255))
                 p.drawText(
                     QRectF(x - 44, lane_top + 4, 88, 20),
                     Qt.AlignmentFlag.AlignCenter,
-                    MOTION_GLYPHS.get(note.motion, note.motion.value),
+                    MOTION_GLYPHS.get(motion_note.motion, motion_note.motion.value),
                 )
-            if status is NoteStatus.MISS:
-                p.setPen(QPen(STATUS_COLORS[NoteStatus.MISS], 3))
-                r = ICON_RADIUS * 0.7
-                p.drawLine(QPointF(x - r, lane_mid - r), QPointF(x + r, lane_mid + r))
-                p.drawLine(QPointF(x - r, lane_mid + r), QPointF(x + r, lane_mid - r))
+
+    def _paint_note_icon(
+        self,
+        p: QPainter,
+        note: ComboInput,
+        status: NoteStatus,
+        cx: float,
+        cy: float,
+        radius: float,
+    ) -> None:
+        """Draw one note's circle + label + (if judged) status treatment, at
+        an arbitrary radius so cluster icons shrink cleanly."""
+        color = BUTTON_COLORS.get(note.button, QColor(200, 200, 200))
+        alpha = 255
+        if status in (NoteStatus.PERFECT, NoteStatus.GOOD):
+            color, alpha = STATUS_COLORS[status], 120  # judged: ghosted
+        elif status is NoteStatus.MISS:
+            color, alpha = STATUS_COLORS[status], 160
+        elif status is NoteStatus.SKIPPED:
+            color, alpha = STATUS_COLORS[status], 80
+
+        scale = radius / ICON_RADIUS
+        c = QColor(color)
+        c.setAlpha(alpha)
+        p.setPen(QPen(QColor(255, 255, 255, alpha), max(1.0, 2.0 * scale)))
+        p.setBrush(c)
+        p.drawEllipse(QPointF(cx, cy), radius, radius)
+
+        font = QFont(self._icon_font)
+        font.setPointSize(max(ICON_FONT_MIN_PT, round(radius * ICON_FONT_RATIO)))
+        p.setFont(font)
+        p.setPen(QColor(10, 10, 14, alpha))
+        p.drawText(
+            QRectF(cx - radius, cy - radius, radius * 2, radius * 2),
+            Qt.AlignmentFlag.AlignCenter,
+            BUTTON_LABELS.get(note.button, note.button.value[:2]),
+        )
+
+        if status is NoteStatus.MISS:
+            p.setPen(QPen(STATUS_COLORS[NoteStatus.MISS], max(1.5, 3.0 * scale)))
+            r = radius * 0.7
+            p.drawLine(QPointF(cx - r, cy - r), QPointF(cx + r, cy + r))
+            p.drawLine(QPointF(cx - r, cy + r), QPointF(cx + r, cy - r))
 
     def _paint_effects(self, p: QPainter, hit_x: int, lane_mid: int) -> None:
         now = time.monotonic()

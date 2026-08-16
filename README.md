@@ -59,6 +59,7 @@ lookup table on the next poll, no restart.
 
 - `models.py` — JSON schema v1, ComboFile/ComboInput, ComboManager, timing windows
 - `profiles.py` — device/game/layout hierarchy, bindings, resolution, ProfileManager
+- `cluster_layout.py` — pure grid math for rendering simultaneous inputs as one cluster
 - `games.py` — built-in 16-button leverless device + Marvel Tōkon profile
 - `frame_clock.py` — thread-safe extrapolated video-frame clock (the canonical time source)
 - `motion_parser.py` — SOCD cleaning, numpad mapping, ring buffer, motion recognition
