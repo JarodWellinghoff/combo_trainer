@@ -1,0 +1,3 @@
+PyQt6>=6.6
+python-mpv>=1.0.6
+XInput-Python>=0.4.0
