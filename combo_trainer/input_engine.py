@@ -52,6 +52,15 @@ Directions never travel the button path: they are OR-ed from whichever
 sources the profile binds to each cardinal, SOCD-cleaned, then pushed to the
 motion parser's ring buffer.
 
+Per-tick summary
+-----------------
+Every tick where a direction edge fired or at least one action fired also
+emits a single `FrameState` (frame, direction, and the tick's `InputEvent`s
+bundled together) via `frame_state`. This is for consumers that want "what
+was active this frame" as one payload rather than correlating two
+independently-timed signals — see `input_history.py`, the live input-history
+panel's Motions/Actions parser.
+
 Pad selection: by default the thread auto-locks to the first connected
 XInput slot; the controller-test dialog can pin a specific slot with
 `set_pad_index(0..3)` or return to auto with `set_pad_index(None)`.
@@ -65,11 +74,11 @@ without touching XInput from a second thread.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .frame_clock import FrameClock
+from .input_types import TRIGGER_THRESHOLD, FrameState, InputEvent, PadSnapshot
 from .models import Button, Motion
 from .motion_parser import (
     DirectionRingBuffer,
@@ -86,7 +95,6 @@ except Exception:  # pragma: no cover
     XInput = None
 
 
-TRIGGER_THRESHOLD = 0.5
 POLL_INTERVAL_S = 0.004  # ~250 Hz
 MONITOR_INTERVAL_S = 1 / 30  # snapshot rate for the test dialog
 NUM_SLOTS = 4
@@ -108,58 +116,10 @@ def default_profile() -> ResolvedProfile:
 DEFAULT_BUTTON_MAP: dict[str, Button] = default_profile().button_map()
 
 
-@dataclass(frozen=True)
-class InputEvent:
-    """A confirmed action-button press, fully resolved."""
-
-    frame: int
-    button: Button
-    motion: Motion  # Motion.NONE == bare button / single-button motion input
-    direction: int  # numpad direction held at press time
-    t_monotonic: float
-    logical_id: str = ""    # e.g. "QUICK_SKILL" — the game's own vocabulary
-    logical_name: str = ""  # e.g. "Quick Skill" — display text
-    source: str = ""        # raw XInput token that fired it
-    macro: bool = False     # True when one switch fired several inputs
-    command_normal: bool = False  # True when this switch also bound a direction
-
-    @property
-    def display_name(self) -> str:
-        return self.logical_name or self.button.value
-
-
-@dataclass(frozen=True)
-class PadSnapshot:
-    """Raw live state of one XInput slot, for the controller/rebind dialogs."""
-
-    index: int
-    connected: bool
-    buttons: dict[str, bool] = field(default_factory=dict)
-    lt: float = 0.0
-    rt: float = 0.0
-    direction: int = 5  # SOCD-cleaned numpad (facing mirror NOT applied)
-
-    def pressed(self, source: str) -> bool:
-        """Uniform read for any XInput source, triggers included."""
-        if source == "LEFT_TRIGGER":
-            return self.lt >= TRIGGER_THRESHOLD
-        if source == "RIGHT_TRIGGER":
-            return self.rt >= TRIGGER_THRESHOLD
-        return bool(self.buttons.get(source, False))
-
-    @property
-    def any_pressed(self) -> bool:
-        return (
-            any(self.buttons.values())
-            or self.lt >= TRIGGER_THRESHOLD
-            or self.rt >= TRIGGER_THRESHOLD
-            or self.direction != 5
-        )
-
-
 class InputThread(QThread):
     input_event = pyqtSignal(object)  # InputEvent
     direction_changed = pyqtSignal(int)  # numpad dir (facing-mirrored)
+    frame_state = pyqtSignal(object)  # FrameState — bundled per-tick payload
     connected_changed = pyqtSignal(bool)
     active_pad_changed = pyqtSignal(int)  # slot index, -1 = none
     monitor_state = pyqtSignal(object)  # list[PadSnapshot], all 4 slots
@@ -385,15 +345,20 @@ class InputThread(QThread):
             direction = self._direction_from(profile, pressed_now)
             if not self._facing_right:
                 direction = mirror_direction(direction)
-            if self._buffer.push(now, direction):
+            direction_edge = self._buffer.push(now, direction)
+            if direction_edge:
                 self.direction_changed.emit(direction)
 
             # -- action buttons: rising edges only (no negative edge in Tōkon) -
+            # `frame` is read once for the whole tick (not per source) so every
+            # event this tick — and the FrameState bundling them below — carry
+            # the identical frame number, never a microsecond-apart neighbor.
+            frame = self._clock.current_frame()
             motion: Motion | None = None  # parsed at most once per poll
+            tick_events: list[InputEvent] = []
             for source, actions in profile.actions.items():
                 if not pressed_now.get(source, False) or prev_pressed.get(source, False):
                     continue
-                frame = self._clock.current_frame()
                 is_macro = len(actions) > 1
                 for action in actions:
                     if action.command_normal:
@@ -411,20 +376,30 @@ class InputThread(QThread):
                     else:
                         # Single-button motion input: the button IS the motion.
                         resolved_motion = Motion.NONE
-                    self.input_event.emit(
-                        InputEvent(
-                            frame=frame,
-                            button=action.button,
-                            motion=resolved_motion,
-                            direction=direction,
-                            t_monotonic=now,
-                            logical_id=action.logical_id,
-                            logical_name=action.logical_name,
-                            source=source,
-                            macro=is_macro,
-                            command_normal=action.command_normal,
-                        )
+                    ev = InputEvent(
+                        frame=frame,
+                        button=action.button,
+                        motion=resolved_motion,
+                        direction=direction,
+                        t_monotonic=now,
+                        logical_id=action.logical_id,
+                        logical_name=action.logical_name,
+                        source=source,
+                        macro=is_macro,
+                        command_normal=action.command_normal,
                     )
+                    self.input_event.emit(ev)
+                    tick_events.append(ev)
             prev_pressed = pressed_now
+
+            if direction_edge or tick_events:
+                self.frame_state.emit(
+                    FrameState(
+                        frame=frame,
+                        t_monotonic=now,
+                        direction=direction,
+                        events=tuple(tick_events),
+                    )
+                )
 
             time.sleep(POLL_INTERVAL_S)

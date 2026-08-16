@@ -10,6 +10,8 @@ Signal flow (arrows are queued Qt connections = thread-safe):
         AppMode.RECORD   ──▶ RecordController  ──▶ ComboManager + overlay flash
         AppMode.PRACTICE ──▶ PracticeController ──▶ judge ──▶ overlay + SFX
         AppMode.IDLE     ──▶ dropped
+                     └──FrameState──▶ InputHistoryPanel (live, video-independent —
+                                       every mode, including IDLE)
 
   QTimer (16 ms) ──▶ label refresh, overlay repaint, PracticeController.on_frame
 """
@@ -32,6 +34,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QAction, QActionGroup  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QComboBox,
+    QDockWidget,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -48,6 +51,7 @@ from .controller_dialog import ControllerTestDialog  # noqa: E402
 from .controllers import NoteStatus, PracticeController, RecordController  # noqa: E402
 from .frame_clock import FrameClock  # noqa: E402
 from .input_engine import InputThread  # noqa: E402
+from .input_history_panel import InputHistoryPanel  # noqa: E402
 from .models import ComboManager  # noqa: E402
 from .profile_dialog import ProfileDialog  # noqa: E402
 from .profiles import ProfileManager, ResolvedProfile  # noqa: E402
@@ -257,6 +261,23 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.pad_label)
         self.statusBar().showMessage("Open a video to begin.  Mode: IDLE")
 
+        self._build_history_dock()
+
+    def _build_history_dock(self) -> None:
+        """Live input-history log — separate from the video-synced timeline
+        overlay, active in every mode (including IDLE) since it doesn't need
+        a loaded combo or a scheduled note to show anything."""
+        self.history_panel = InputHistoryPanel(parent=self)
+        self.history_panel.bind(self.input_thread)
+
+        self.history_dock = QDockWidget("Input History", self)
+        self.history_dock.setObjectName("input_history_dock")
+        self.history_dock.setWidget(self.history_panel)
+        self.history_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.history_dock)
+
     def _build_transport_bar(self, parent: QWidget) -> QWidget:
         bar = QWidget(parent)
         lay = QHBoxLayout(bar)
@@ -345,6 +366,11 @@ class MainWindow(QMainWindow):
         act_profiles.setShortcut("Ctrl+B")
         act_profiles.triggered.connect(self._open_profile_dialog)
         m_input.addAction(act_profiles)
+
+        act_history = self.history_dock.toggleViewAction()
+        act_history.setText("Input &History")
+        act_history.setShortcut("Ctrl+H")
+        m_input.addAction(act_history)
 
         m_input.addSeparator()
         self.menu_layouts = m_input.addMenu("Active &Layout")

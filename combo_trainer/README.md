@@ -25,6 +25,12 @@ timeline, frame-graded timing, and hit-confirm feedback — at any playback spee
   XInput slot, watch all 16 switches with their current bindings, and confirm
   motions parse (e.g. QCF) before recording. The `dir: N` readout (numpad
   notation, top-right of the lane) live-verifies your box's output.
+- **Ctrl+H** toggles the Input History dock: a live, vertically-scrolling
+  command-history log (SF6/Tekken/GGST training-mode style) — newest at the
+  top, each row split into a Motions column (left) and an Actions column
+  (right) so simultaneous presses read as one row instead of a jumble. Active
+  in every mode, including IDLE — it's independent of the video and any
+  loaded combo, unlike the timeline overlay below.
 
 ## Profiles & rebinding
 
@@ -68,13 +74,16 @@ lookup table on the next poll, no restart.
 - `games.py` — built-in 16-button leverless device + Marvel Tōkon profile
 - `frame_clock.py` — thread-safe extrapolated video-frame clock (the canonical time source)
 - `motion_parser.py` — SOCD cleaning, numpad mapping, ring buffer, motion recognition
+- `input_types.py` — Qt-free InputEvent/FrameState/PadSnapshot dataclasses
 - `input_engine.py` — 250 Hz XInput QThread, rising-edge detection, InputEvent stream
+- `input_history.py` — pure Motions/Actions parser + bounded buffer for the live history panel
 - `controllers.py` — Record sink + Practice matcher/judge with stats and seek resync
 - `timeline.py` — scrolling icon lane, hit zone, sparks, judgement popups
 - `audio.py` — procedurally generated hit-confirm WAV + QSoundEffect
 - `state.py` — IDLE/RECORD/PRACTICE state machine with guarded transitions
 - `controller_dialog.py` — controller test modal: slots, live switches, pipeline check
 - `profile_dialog.py` — profile picker + rebinding modal (press-to-select)
+- `input_history_panel.py` — live vertical input-history dock (Ctrl+H)
 - `main_window.py` — PyQt6 shell + embedded mpv, wires everything together
 - `app.py` — entry point, Windows libmpv DLL discovery
 
